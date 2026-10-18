@@ -55,7 +55,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
     /// Synchronous version of [`RateLimiter::clean`].
     pub fn clean_sync(&self, before: Instant) {
         let before = self.relative(before);
-        self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= before);
+        self.limits.retain_sync(move |_, v| *AtomicU64::get_mut(&mut v.0) >= before);
         self.last_gc.store(1, Ordering::Relaxed); // manual reset
     }
 
@@ -84,12 +84,12 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
     pub fn req_sync(&self, key: K, quota: Quota, now: Instant) -> Result<(), RateLimitError> {
         let now = self.relative(now);
 
-        let Some(res) = self.limits.read(&key, |_, gcra| gcra.req(quota, now)) else {
+        let Some(res) = self.limits.read_sync(&key, |_, gcra| gcra.req(quota, now)) else {
             if self.should_gc() {
-                self.limits.retain(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
+                self.limits.retain_sync(move |_, v| *AtomicU64::get_mut(&mut v.0) >= now);
             }
 
-            return match self.limits.entry(key) {
+            return match self.limits.entry_sync(key) {
                 Entry::Occupied(gcra) => gcra.get().req(quota, now),
                 Entry::Vacant(gcra) => {
                     gcra.insert_entry(Gcra::first(quota, now));
@@ -180,7 +180,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         Q: Eq + Hash + ?Sized,
     {
         self.limits
-            .read(key, |_, grca| {
+            .read_sync(key, |_, grca| {
                 grca.0.fetch_add(penalty.as_nanos() as u64, Ordering::Relaxed)
             })
             .is_some()
@@ -201,7 +201,7 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.limits.remove(key).is_some()
+        self.limits.remove_sync(key).is_some()
     }
 }
 
