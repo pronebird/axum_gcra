@@ -8,7 +8,7 @@ use std::{
     fmt::{self, Debug, Display},
     future::Future,
     hash::Hash,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     ops::Deref,
     str::FromStr,
     task::{Context, Poll},
@@ -199,42 +199,57 @@ impl<I> Layer<I> for RealIpLayer {
     }
 }
 
+/// Returns the first entry of a comma-separated header value.
+fn first_entry(s: &HeaderValue) -> Option<&str> {
+    s.to_str().ok()?.split(',').next().map(str::trim)
+}
+
+/// Parses `10.0.0.1`, `2fa::1`, `[2fa::1]`, `10.0.0.1:443` or `[2fa::1]:443`.
 fn parse_ip(s: &HeaderValue) -> Option<IpAddr> {
-    let s = s.to_str().ok()?;
+    let s = first_entry(s)?;
 
-    // get the first element
-    let first = s.split(',').next()?.trim();
+    if let Ok(ip) = IpAddr::from_str(s) {
+        return Some(ip);
+    }
 
-    // cut the port and [] if they exists
-    let ip_only = if let Some(part) = first.strip_prefix('[') {
-        // ipv6 with port
-        part.split(']').next()?
-    } else if first.chars().map(|c| if c == ':' { 1 } else { 0 }).sum::<u32>() == 1 {
-        // take off the port from an IPv4
-        first.split(':').next()?
-    } else {
-        first
-    };
+    if let Ok(addr) = SocketAddr::from_str(s) {
+        return Some(addr.ip());
+    }
 
-    IpAddr::from_str(ip_only).ok()
+    let ip = s.strip_prefix('[')?.strip_suffix(']')?;
+    Ipv6Addr::from_str(ip).ok().map(IpAddr::V6)
+}
+
+/// Parses `cloudfront-viewer-address`, which is always `ip:port`, with IPv6 addresses
+/// not enclosed in brackets, e.g. `198.51.100.10:46532` or `2a05:d018::1:46532`.
+fn parse_ip_with_port(s: &HeaderValue) -> Option<IpAddr> {
+    let (ip, port) = first_entry(s)?.rsplit_once(':')?;
+    port.parse::<u16>().ok()?;
+
+    match ip.strip_prefix('[') {
+        Some(ip) => Ipv6Addr::from_str(ip.strip_suffix(']')?).ok().map(IpAddr::V6),
+        None => ip.parse().ok(),
+    }
 }
 
 pub(crate) fn get_ip_from_parts(parts: &Parts) -> Option<RealIp> {
-    static HEADERS: [HeaderName; 10] = [
-        HeaderName::from_static("cf-connecting-ip"), // used by Cloudflare sometimes
-        HeaderName::from_static("x-cluster-client-ip"), // used by AWS sometimes
-        HeaderName::from_static("fly-client-ip"),    // used by Fly.io sometimes
-        HeaderName::from_static("fastly-client-ip"), // used by Fastly sometimes
-        HeaderName::from_static("cloudfront-viewer-address"), // used by Cloudfront sometimes
-        HeaderName::from_static("x-real-ip"),
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderName::from_static("x-original-forwarded-for"), // maybe used by Cloudfront?
-        HeaderName::from_static("true-client-ip"),           // used by some load balancers
-        HeaderName::from_static("client-ip"),                // used by some load balancers
+    type Parser = fn(&HeaderValue) -> Option<IpAddr>;
+
+    static HEADERS: [(HeaderName, Parser); 10] = [
+        (HeaderName::from_static("cf-connecting-ip"), parse_ip), // used by Cloudflare sometimes
+        (HeaderName::from_static("x-cluster-client-ip"), parse_ip), // used by AWS sometimes
+        (HeaderName::from_static("fly-client-ip"), parse_ip),    // used by Fly.io sometimes
+        (HeaderName::from_static("fastly-client-ip"), parse_ip), // used by Fastly sometimes
+        (HeaderName::from_static("cloudfront-viewer-address"), parse_ip_with_port), // used by Cloudfront sometimes
+        (HeaderName::from_static("x-real-ip"), parse_ip),
+        (HeaderName::from_static("x-forwarded-for"), parse_ip),
+        (HeaderName::from_static("x-original-forwarded-for"), parse_ip), // maybe used by Cloudfront?
+        (HeaderName::from_static("true-client-ip"), parse_ip),           // used by some load balancers
+        (HeaderName::from_static("client-ip"), parse_ip),                // used by some load balancers
     ];
 
-    for header in &HEADERS {
-        if let Some(real_ip) = parts.headers.get(header).and_then(parse_ip) {
+    for (header, parse) in &HEADERS {
+        if let Some(real_ip) = parts.headers.get(header).and_then(parse) {
             return Some(RealIp(real_ip));
         }
     }
@@ -251,39 +266,70 @@ pub(crate) fn get_ip_from_parts(parts: &Parts) -> Option<RealIp> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_ip_v4() {
-        let header = HeaderValue::from_static(" 10.0.0.1");
-        assert_eq!(IpAddr::from_str("10.0.0.1").ok(), parse_ip(&header));
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
 
-        // with port
-        let header = HeaderValue::from_static(" 10.0.0.1:50000");
-        assert_eq!(IpAddr::from_str("10.0.0.1").ok(), parse_ip(&header));
+    fn parse(s: &'static str) -> Option<IpAddr> {
+        parse_ip(&HeaderValue::from_static(s))
+    }
 
-        // multiple hops
-        let header = HeaderValue::from_static(" 10.0.0.1, 10.10.10.10");
-        assert_eq!(IpAddr::from_str("10.0.0.1").ok(), parse_ip(&header));
-
-        // many with port
-        let header = HeaderValue::from_static(" 10.0.0.1:50000, 10.10.10.10:50000");
-        assert_eq!(IpAddr::from_str("10.0.0.1").ok(), parse_ip(&header));
+    fn parse_with_port(s: &'static str) -> Option<IpAddr> {
+        parse_ip_with_port(&HeaderValue::from_static(s))
     }
 
     #[test]
-    fn parse_ip_v6() {
-        let header = HeaderValue::from_static(" 2fa::1");
-        assert_eq!(IpAddr::from_str("2fa::1").ok(), parse_ip(&header));
+    fn parse_ipv4() {
+        assert_eq!(parse("10.0.0.1"), ip("10.0.0.1"));
+        assert_eq!(parse(" 10.0.0.1 "), ip("10.0.0.1"));
+        assert_eq!(parse("10.0.0.1:50000"), ip("10.0.0.1"));
+        assert_eq!(parse("10.0.0.1, 10.10.10.10"), ip("10.0.0.1"));
+        assert_eq!(parse("10.0.0.1:50000, 10.10.10.10:50000"), ip("10.0.0.1"));
+    }
 
-        // with port
-        let header = HeaderValue::from_static(" [2fa::1]:50000");
-        assert_eq!(IpAddr::from_str("2fa::1").ok(), parse_ip(&header));
+    #[test]
+    fn parse_ipv6() {
+        assert_eq!(parse("2fa::1"), ip("2fa::1"));
+        assert_eq!(parse("[2fa::1]"), ip("2fa::1"));
+        assert_eq!(parse("[2fa::1]:50000"), ip("2fa::1"));
+        assert_eq!(parse("2fa::1, 2fa::2"), ip("2fa::1"));
+        assert_eq!(parse("[2fa::1]:50000, [2fa::2]:50000"), ip("2fa::1"));
+        assert_eq!(parse("::ffff:10.0.0.1"), ip("::ffff:10.0.0.1"));
+    }
 
-        // with more proxies
-        let header = HeaderValue::from_static(" 2fa::1, 2fa::2");
-        assert_eq!(IpAddr::from_str("2fa::1").ok(), parse_ip(&header));
+    #[test]
+    fn parse_invalid() {
+        assert_eq!(parse(""), None);
+        assert_eq!(parse("unknown"), None);
+        assert_eq!(parse("10.0.0.1:"), None);
+        assert_eq!(parse("[2fa::1"), None);
+        assert_eq!(parse("2fa::1]"), None);
+        assert_eq!(parse("[2fa::1]garbage"), None);
+        assert_eq!(parse("[10.0.0.1]"), None);
+    }
 
-        // many with port
-        let header = HeaderValue::from_static(" [2fa::1]:50000, [2fa::2]:50000");
-        assert_eq!(IpAddr::from_str("2fa::1").ok(), parse_ip(&header));
+    #[test]
+    fn parse_cloudfront_viewer_address() {
+        assert_eq!(parse_with_port("198.51.100.10:46532"), ip("198.51.100.10"));
+        assert_eq!(parse_with_port("2a05:d018::1:46532"), ip("2a05:d018::1"));
+        // the port would otherwise be mistaken for the last segment of the address
+        assert_eq!(parse_with_port("2001:db8::1:443"), ip("2001:db8::1"));
+        assert_eq!(parse_with_port("[2001:db8::1]:443"), ip("2001:db8::1"));
+
+        assert_eq!(parse_with_port("198.51.100.10"), None);
+        assert_eq!(parse_with_port("198.51.100.10:99999"), None);
+    }
+
+    #[test]
+    fn header_priority() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "10.0.0.2")
+            .header("cloudfront-viewer-address", "2001:db8::1:443")
+            .body(())
+            .unwrap();
+
+        let (parts, _) = req.into_parts();
+
+        assert_eq!(get_ip_from_parts(&parts).map(|ip| ip.0), ip("2001:db8::1"));
     }
 }
