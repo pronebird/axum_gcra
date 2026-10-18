@@ -100,7 +100,13 @@ See the docs for [`GCInterval`] for more information.
 
 The follow features are enabled by default but can be disabled if not needed:
 
-- `ahash`: Use the [`ahash`] crate for faster hashing of keys.
 - `tokio`: Use the [`tokio`] crate for time-based GC intervals and specific socket utilities.
 - `real_ip`: Enable the [`RealIp`] extractor, also enables the `tokio` feature.
 - `itoa`: Use the [`itoa`] crate for integer to string conversion.
+
+Keys are hashed with [`foldhash`] by default, which can be replaced with any other `BuildHasher`
+through the second type parameter of [`RateLimitLayer`], e.g. `RateLimitLayer::<Key, MyHasher>`.
+
+# Minimum Supported Rust Version
+
+The MSRV is Rust 1.87.
