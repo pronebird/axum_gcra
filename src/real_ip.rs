@@ -10,7 +10,6 @@ use std::{
     hash::Hash,
     net::{IpAddr, SocketAddr},
     ops::Deref,
-    pin::Pin,
     str::FromStr,
     task::{Context, Poll},
 };
@@ -125,28 +124,17 @@ impl IntoResponse for IpAddrRejection {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(transparent)]
-struct IpFut<T>(Result<T, IpAddrRejection>);
-
-impl<T: Copy> Future for IpFut<T> {
-    type Output = Result<T, IpAddrRejection>;
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(self.0)
-    }
-}
+use std::future::ready;
 
 impl<S> FromRequestParts<S> for RealIp {
     type Rejection = IpAddrRejection;
 
     fn from_request_parts(parts: &mut Parts, _: &S) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         if let Some(ip) = parts.extensions.get::<RealIp>() {
-            return IpFut(Ok(*ip));
+            return ready(Ok(*ip));
         }
 
-        IpFut(match get_ip_from_parts(parts) {
+        ready(match get_ip_from_parts(parts) {
             Some(ip) => Ok(ip),
             None => Err(IpAddrRejection),
         })
@@ -158,10 +146,10 @@ impl<S> FromRequestParts<S> for RealIpPrivacyMask {
 
     fn from_request_parts(parts: &mut Parts, _: &S) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         if let Some(&ip) = parts.extensions.get::<RealIp>() {
-            return IpFut(Ok(ip.into()));
+            return ready(Ok(ip.into()));
         }
 
-        IpFut(match get_ip_from_parts(parts) {
+        ready(match get_ip_from_parts(parts) {
             Some(ip) => Ok(ip.into()),
             None => Err(IpAddrRejection),
         })
