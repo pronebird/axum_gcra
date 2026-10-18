@@ -160,7 +160,7 @@ struct RouteWithKey<T> {
 
 impl<T> RouteWithKey<T> {
     #[inline]
-    fn as_route(&self) -> Route {
+    fn as_route(&self) -> Route<'_> {
         Route {
             path: Cow::Borrowed(&*self.path),
             method: Cow::Borrowed(&self.method),

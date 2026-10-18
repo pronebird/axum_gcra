@@ -36,7 +36,8 @@ impl<K: Eq + Hash, H: BuildHasher> RateLimiter<K, H> {
     }
 
     fn should_gc(&self) -> bool {
-        self.gc_interval != u64::MAX && 0 == self.last_gc.fetch_add(1, Ordering::Relaxed) % self.gc_interval
+        self.gc_interval != u64::MAX
+            && self.last_gc.fetch_add(1, Ordering::Relaxed).is_multiple_of(self.gc_interval)
     }
 
     #[inline]
